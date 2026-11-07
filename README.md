@@ -55,6 +55,28 @@ next run with a new slug does one cold fetch, and boots stay instant after.
 | `convert.go` | Firestore typed values ⇄ Go values, edit parsing |
 | `config.go` | ⚙️ **user-editable flags (hackathon slug, write switch)** |
 
+## Bonus records
+
+- **Socials doc** — selecting an applicant also loads their `Socials/{uid}`
+  companion doc and appends all its fields to the details view (nicknamed the
+  `◆ Socials` section). Its fields are editable too: paths prefixed `social.`
+  in the edit list write to `Socials/{uid}` (patching only the top-level field
+  touched). If the doc doesn't exist yet, the first edit creates it in the
+  shape the portal expects.
+- **Stamps by name** — stamp IDs never appear: the `/Stamps` collection is
+  loaded at boot and `unlockedStamps` ids resolve to their `name` on display,
+  in both the details view and the edit list. When editing an
+  `unlockedStamps` field you type stamp *names* (comma-separated); names are
+  converted back to stamp IDs before the save, and unknown names are
+  rejected so raw ids can't sneak into the doc.
+- **Manual stamping** — press `s` in the details view to open the stamp
+  picker: the full `/Stamps` roster sorted by name, with `✓` on stamps the
+  applicant has unlocked and `○` on locked ones. Enter/space toggles the
+  highlighted stamp instantly — the change writes to
+  `Socials/{uid}.unlockedStamps[<hackathon>]` right away and the row flips
+  in place (a no-socials-doc applicant gets one created on first toggle).
+  `esc` returns to the details view.
+
 ## Tests
 
 ```sh

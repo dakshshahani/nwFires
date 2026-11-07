@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -143,6 +144,7 @@ const (
 	modeDetails
 	modeEditPick
 	modeEditInput
+	modeStamps
 )
 
 type loadDoneMsg struct {
@@ -167,11 +169,23 @@ type refreshDoneMsg struct {
 // notifHideMsg dismisses the bottom-right snapshot notification.
 type notifHideMsg struct{}
 
+type socialsLoadedMsg struct {
+	uid    string
+	social *Social
+	err    error
+}
+
+type stampsLoadedMsg struct {
+	stamps []Stamp
+	err    error
+}
+
 type model struct {
 	mode    mode
 	err     error
 	apps    []Applicant // all
 	results []Applicant // filtered
+	hasData bool        // boot finished (cache or live) — gates early msgs
 
 	query   textinput.Model
 	cursor  int
@@ -180,10 +194,15 @@ type model struct {
 	detailViewport viewport.Model
 	detailContent  string
 
+	stampID2name map[string]string
+	stampName2id map[string]string
+
 	editPaths []string
 	editIdx   int
 	editInput textinput.Model
 	editTop   string // top-level field being saved
+	editIsSocial bool
+
 	statusMsg string
 	statusErr bool
 
@@ -193,6 +212,10 @@ type model struct {
 	cached         time.Time // when the boot snapshot was taken (zero = live load)
 	refreshingNote string    // subtle header note while the bg refresh runs
 	notifExpire    time.Time // bottom-right toast expiry (zero = hidden)
+
+	stampList   []Stamp  // sorted roster for the manual stamp picker
+	stampCursor int
+	stampSaving bool
 
 	width  int
 	height int
@@ -268,7 +291,25 @@ func (m *model) filter() {
 var activeCache *cache
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(loadBootCmd, m.spinner.Tick)
+	return tea.Batch(loadBootCmd, m.fetchStampsCmd(), m.spinner.Tick)
+}
+
+// fetchStampsCmd loads the /Stamps name map once at boot. Names (not ids) are
+// what the user sees; on failure the raw ids display instead.
+func (m model) fetchStampsCmd() tea.Cmd {
+	return func() tea.Msg {
+		stamps, err := fetchStamps()
+		return stampsLoadedMsg{stamps: stamps, err: err}
+	}
+}
+
+// socialsCmd fetches the companion Socials/{uid} doc for the selected
+// applicant off the UI thread.
+func socialsCmd(a *Applicant) tea.Cmd {
+	return func() tea.Msg {
+		s, err := fetchSocial(a.ID)
+		return socialsLoadedMsg{uid: a.ID, social: s, err: err}
+	}
 }
 
 // loadBootCmd opens the SQLite snapshot. Cold cache: fetch, store, and enter
@@ -295,6 +336,8 @@ func fetchCmd() tea.Msg {
 	apps, err := fetchApplicants()
 	return loadDoneMsg{apps: apps, err: err}
 }
+
+// --- socials/stamps wiring ---
 
 // refreshNow refetches the live roster and replaces both memory and snapshot.
 func refreshNow() tea.Msg {
@@ -353,6 +396,67 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshingNote = styleAccent.Render("⟳ refreshing…")
 		return m, func() tea.Msg { return refreshNow() }
 
+	case stampsLoadedMsg:
+		if msg.err == nil {
+			m.stampID2name, m.stampName2id = map[string]string{}, map[string]string{}
+			for _, s := range msg.stamps {
+				if s.ID == "" {
+					continue
+				}
+				m.stampID2name[s.ID] = s.Name
+				if s.Name != "" {
+					m.stampName2id[s.Name] = s.ID
+				}
+			}
+			// Sorted roster for the manual stamp picker (modeStamps).
+			m.stampList = append([]Stamp(nil), msg.stamps...)
+			sort.Slice(m.stampList, func(i, j int) bool {
+				a, b := m.stampList[i], m.stampList[j]
+				return a.Name+" "+a.ID < b.Name+" "+b.ID
+			})
+			// If details are open, re-render with stamp names instead of ids.
+			if m.mode == modeDetails && m.current != nil {
+				if cmd := m.openDetails(m.current); cmd != nil {
+					return m, cmd
+				}
+			}
+		}
+		return m, nil
+
+	case socialsLoadedMsg:
+		if msg.err != nil {
+			if m.mode == modeDetails && m.current != nil && m.current.ID == msg.uid {
+				m.statusMsg = " ✗ Socials fetch failed: " + msg.err.Error()
+				m.statusErr = true
+			}
+			return m, nil
+		}
+		if m.current != nil && m.current.ID == msg.uid {
+			m.current.social = msg.social
+			if m.mode == modeDetails {
+				if cmd := m.openDetails(m.current); cmd != nil {
+					return m, cmd
+				}
+			}
+			if m.mode == modeStamps {
+				m.detailContent = m.detailsText()
+			}
+		}
+		return m, nil
+
+	case stampedMsg:
+		m.stampSaving = false
+		switch {
+		case msg.err != nil:
+			m.statusMsg = " ✗ Stamp save failed: " + msg.err.Error()
+			m.statusErr = true
+		case msg.on:
+			m.statusMsg, m.statusErr = " ✓ Unlocked “"+msg.name+"”", false
+		default:
+			m.statusMsg, m.statusErr = " ✓ Removed “"+msg.name+"”", false
+		}
+		return m, nil
+
 	case refreshDoneMsg:
 		if msg.err != nil {
 			// Keep serving the snapshot; surface why the refresh failed.
@@ -379,7 +483,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg = " ✗ Save failed: " + msg.err.Error()
 			m.statusErr = true
 		} else {
-			m.openDetails(m.current) // re-render from fresh data
+			if m.mode == modeStamps {
+				// A stamp toggle just landed; stay in the picker, refresh the
+				// in-memory detail text for when the user returns.
+				m.detailContent = m.detailsText()
+			} else {
+				cmd := m.openDetails(m.current) // re-render from fresh data
+				if cmd != nil {
+					return m, tea.Batch(func() tea.Msg { return nil }, cmd)
+				}
+			}
 			// Set after openDetails, which resets the status slot: otherwise the
 			// confirmation is cleared the instant it is produced.
 			m.statusMsg = " ✓ Saved"
@@ -435,8 +548,108 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateEditPick(msg)
 	case modeEditInput:
 		return m.updateEditInput(msg)
+	case modeStamps:
+		return m.updateStamps(msg)
 	}
 	return m, nil
+}
+
+func (m model) updateStamps(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if km, ok := msg.(tea.KeyMsg); ok {
+		switch km.String() {
+		case "esc", "e":
+			m.mode = modeDetails
+			return m, nil
+		case "up":
+			if m.stampCursor > 0 {
+				m.stampCursor--
+			}
+			return m, nil
+		case "down", "tab":
+			if m.stampCursor < len(m.stampList)-1 {
+				m.stampCursor++
+			}
+			return m, nil
+		case "enter", " ", "space":
+			return m.toggleStamp()
+		}
+	}
+	return m, nil
+}
+
+func (m model) stampsBody(h int) string {
+	if m.current == nil {
+		return "   " + styleEmpty.Render("no applicant selected")
+	}
+	lines := []string{
+		" " + styleLabel.Render("stamps for "+displayName(m.current)) + "  " +
+			styleLabel.Render("("+hackathon+")"),
+		"",
+	}
+	if m.current.social != nil && m.current.social.missing {
+		lines = append(lines, "   "+styleEmpty.Render("(no socials doc yet — first toggle writes it)"), "")
+	}
+	_, _, _, unlockedCount := m.stampCounts()
+	lines[0] += styleCount.Render(fmt.Sprintf("   ·   %d/%d unlocked", unlockedCount, len(m.stampList)))
+	size := h - 3
+	vis := size
+	if len(m.stampList) > size {
+		vis = size - 1
+	}
+	start, end := window(m.stampCursor, len(m.stampList), vis)
+	for i := start; i < end; i++ {
+		lines = append(lines, m.renderStampRow(i))
+	}
+	if end < len(m.stampList) {
+		lines = append(lines, "   "+styleEmpty.Render(fmt.Sprintf("↓ %d more", len(m.stampList)-end)))
+	}
+	return fit(lines, h)
+}
+
+// stampCounts summarises unlocked/total; the last value is unlocked count.
+func (m model) stampCounts() (nameW, idW, total, unlocked int) {
+	for _, st := range m.stampList {
+		if m.current != nil && m.current.social != nil && unlockedFor(m.current.social, st.ID) {
+			unlocked++
+		}
+	}
+	return 0, 0, len(m.stampList), unlocked
+}
+
+func (m model) renderStampRow(i int) string {
+	st := m.stampList[i]
+	unlocked := m.current != nil && m.current.social != nil && unlockedFor(m.current.social, st.ID)
+	glyph, glyphStyle := "○", styleEmpty
+	if unlocked {
+		glyph, glyphStyle = "✓", styleOK
+	}
+	sty, marker := styleRow, "  "
+	nameStyle := styleName
+	// While the write is in flight the cursor holds still; nothing reflows.
+	if i == m.stampCursor {
+		sty, marker = styleRowSel, styleAccent.Render("▎")+" "
+		nameStyle = styleNameSel
+	}
+	line := glyphStyle.Render(pad(glyph, 3)) + nameStyle.Render(elide(st.Name, m.stampNameW())) + "  " +
+		styleUID.Render(elide(st.ID, m.stampIDW()))
+	return marker + sty.Width(m.contentWidth() - 2).Render(line)
+}
+
+// stampNameW splits the row between the name and the (dim) id column.
+func (m model) stampNameW() int {
+	w := (m.contentWidth() - 8) * 55 / 100
+	if w < 12 {
+		w = 12
+	}
+	return w
+}
+
+func (m model) stampIDW() int {
+	w := (m.contentWidth() - 8) * 25 / 100
+	if w < 6 {
+		w = 6
+	}
+	return w
 }
 
 func (m model) updateSearch(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -455,7 +668,10 @@ func (m model) updateSearch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if len(m.results) > 0 {
 				a := m.results[m.cursor]
-				m.openDetails(&a)
+				m.openDetails(&a) // populates m.current
+				if m.current.social == nil {
+					return m, socialsCmd(m.current)
+				}
 			}
 			return m, nil
 		case "esc":
@@ -473,13 +689,24 @@ func (m model) updateSearch(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *model) openDetails(a *Applicant) {
+// detailsText re-renders the detail card contents for the current applicant.
+func (m *model) detailsText() string {
+	return renderDetails(*m, m.current, m.detailViewport.Width)
+}
+
+func (m *model) openDetails(a *Applicant) tea.Cmd {
 	m.current = a
-	m.detailContent = renderDetails(a, m.detailViewport.Width)
+	m.detailContent = renderDetails(*m, a, m.detailViewport.Width)
 	m.detailViewport.SetContent(m.detailContent)
 	m.detailViewport.GotoTop()
 	m.mode = modeDetails
 	m.statusMsg = ""
+	// Companion doc: the socials data loads right after the applicant data
+	// and re-renders the details view when it lands.
+	if a.social == nil {
+		return socialsCmd(a)
+	}
+	return nil
 }
 
 // ---------- details ----------
@@ -516,10 +743,19 @@ func collectEntries(v any, prefix string, out *[]detailEntry) {
 
 // renderDetails renders one applicant for the scrolling detail viewport.
 // width is the usable width inside the card (border and padding excluded).
-func renderDetails(a *Applicant, width int) string {
+func renderDetails(m model, a *Applicant, width int) string {
 	if width < 10 {
 		width = 10
 	}
+	out := renderDocSections(a, width)
+	if a.social != nil {
+		out += "\n" + renderSocialSection(m, a)
+	}
+	return out
+}
+
+// renderDocSections is the applicant-document body (identity block + sections).
+func renderDocSections(a *Applicant, width int) string {
 	tree := a.valueTree()
 
 	type section struct {
@@ -624,6 +860,65 @@ func renderEntry(e detailEntry, keyW, width int) string {
 	return prefix + b.String()
 }
 
+// renderSocialSection is the "◆ Socials" block fed from Socials/{uid}.
+func renderSocialSection(m model, a *Applicant) string {
+	s := a.social
+	if s == nil {
+		return ""
+	}
+	if s.missing {
+		return styleSecHead.Render("◆ Socials") + "\n" +
+			"  " + styleEmpty.Render("(no socials doc yet — first edit creates it)") + "\n"
+	}
+	var b strings.Builder
+	b.WriteString(styleSecHead.Render("◆ Socials") + "\n")
+	tree := s.valueTree()
+	for _, name := range sortedKeys(tree) {
+		if name == "_id" {
+			continue
+		}
+		var entries []detailEntry
+		collectEntries(tree[name], "", &entries)
+		if len(entries) == 0 {
+			continue
+		}
+		b.WriteString("  " + styleKey.Render(humanizeKey(name)) + "\n")
+		for _, e := range entries {
+			if strings.Contains(e.key, "unlockedStamps") {
+				e.value = displayStampValue(e.value, m.stampID2name)
+			}
+			b.WriteString("    " + styleKey.Render(e.key) + " " + styleLeafVal.Render(e.value) + "\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// displayStampValue maps stamp ids to "Name (id)" so uids never appear.
+func displayStampValue(v any, id2name map[string]string) string {
+	items, ok := v.([]any)
+	if !ok {
+		return fmt.Sprint(v)
+	}
+	parts := make([]string, 0, len(items))
+	for _, it := range items {
+		id := strings.TrimSpace(fmt.Sprint(it))
+		if n, ok := id2name[id]; ok {
+			parts = append(parts, n)
+		} else {
+			parts = append(parts, id)
+		}
+	}
+	if len(parts) == 0 {
+		return "(none)"
+	}
+	return strings.Join(parts, ", ")
+}
+
+// stampNamesForModel renders any unlockedStamps leaf to display text.
+func stampNamesValue(m model, val any) string {
+	return displayStampValue(val, m.stampID2name)
+}
+
 // humanizeKey turns stored field names into headings: "basicInfo" -> "Basic info".
 func humanizeKey(s string) string {
 	var b strings.Builder
@@ -664,6 +959,8 @@ func (m model) updateDetails(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "e", "enter":
 			return m.startEdit()
+		case "s":
+			return m.startStamps()
 		}
 	}
 	var cmd tea.Cmd
@@ -697,6 +994,7 @@ func (m model) startEdit() (tea.Model, tea.Cmd) {
 
 	m.editPaths = nil
 	leafPaths(tree, "", &m.editPaths)
+	m.editPaths = append(m.editPaths, m.socialPaths()...)
 	if len(m.editPaths) == 0 {
 		m.statusMsg = " ✗ No editable fields"
 		m.statusErr = true
@@ -705,6 +1003,28 @@ func (m model) startEdit() (tea.Model, tea.Cmd) {
 	m.editIdx = 0
 	m.mode = modeEditPick
 	return m, nil
+}
+
+// socialPaths exposes the companion Socials/{uid} doc in the editor as
+// "social.*" paths, alongside the applicant paths above them.
+func (m model) socialPaths() []string {
+	if m.current == nil || m.current.social == nil {
+		return nil
+	}
+	if m.current.social.missing && m.current.social.Doc == nil {
+		// Skeleton so the doc can be created from scratch on first write.
+		m.current.social.socialDocSeed()
+	}
+	tree := m.current.social.valueTree()
+	var out []string
+	leafPaths(tree, "", &out)
+	for i, p := range out {
+		if p == "_id" {
+			continue
+		}
+		out[i] = "social." + p
+	}
+	return out
 }
 
 func (m model) updateEditPick(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -725,17 +1045,24 @@ func (m model) updateEditPick(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "enter":
 			path := m.editPaths[m.editIdx]
-			val, ok := getLeaf(m.current.valueTree(), path)
+			tree, leaf := m.docFor(path)
+			val, ok := getLeaf(tree, leaf)
 			if !ok || val == nil {
 				val = ""
 			}
 			if _, isMap := val.(map[string]any); isMap {
 				return m, nil // not a leaf; ignore
 			}
-			m.editInput.SetValue(leafToEditable(val))
+			text := leafToEditable(val)
+			// Stamps show as names, so they are entered as names too.
+			if strings.Contains(path, "unlockedStamps") {
+				text = displayStampValue(val, m.stampID2name)
+			}
+			m.editInput.SetValue(text)
 			m.editInput.Focus()
 			m.editInput.CursorEnd()
-			m.editTop = topFieldOfPath(path)
+			m.editTop = topFieldOfPath(leaf)
+			m.editIsSocial = strings.HasPrefix(path, "social.")
 			m.mode = modeEditInput
 			return m, nil
 		}
@@ -752,10 +1079,25 @@ func (m model) updateEditInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "enter":
 			path := m.editPaths[m.editIdx]
-			old, _ := getLeaf(m.current.valueTree(), path)
+			tree, leaf := m.docFor(path)
+			old, _ := getLeaf(tree, leaf)
 			newVal := parseEditInput(old, m.editInput.Value())
-			tree := m.current.valueTree()
-			if !setLeaf(tree, path, newVal) {
+			// unlockedStamps is edited as stamp names; store the ids the
+			// portal writes (Socials/{uid}.unlockedStamps[<hackathon>]).
+			if strings.Contains(path, "unlockedStamps") {
+				ids, err := stampIDsFromNames(m.editInput.Value(), m.stampName2id)
+				if err != nil {
+					m.statusMsg = " ✗ " + err.Error()
+					m.statusErr = true
+					return m, nil
+				}
+				arr := make([]any, len(ids))
+				for i, v := range ids {
+					arr[i] = v
+				}
+				newVal = arr
+			}
+			if !setLeaf(tree, leaf, newVal) {
 				m.statusMsg = " ✗ Cannot edit " + path
 				m.statusErr = true
 				return m, nil
@@ -763,6 +1105,14 @@ func (m model) updateEditInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode = modeDetails // optimistic; status shown after cmd lands
 			m.statusMsg = " ⟳ Saving " + path + "…"
 			m.statusErr = false
+			if m.editIsSocial {
+				s := m.current.social
+				top := m.editTop
+				return m, func() tea.Msg {
+					err := saveSocial(s, []string{top})
+					return savedMsg{err: err}
+				}
+			}
 			a := m.current
 			top := m.editTop
 			return m, func() tea.Msg {
@@ -774,6 +1124,106 @@ func (m model) updateEditInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.editInput, cmd = m.editInput.Update(msg)
 	return m, cmd
+}
+
+// docFor routes an edit path to its document: prefixed "social." paths go to
+// the companion Socials/{uid} doc, everything else to the applicant doc.
+func (m model) docFor(path string) (tree map[string]any, leaf string) {
+	if strings.HasPrefix(path, "social.") {
+		return m.docSocial().valueTree(), strings.TrimPrefix(path, "social.")
+	}
+	return m.current.valueTree(), path
+}
+
+// docSocial guarantees a Social holder on m.current even before its doc loads.
+func (m model) docSocial() *Social {
+	if m.current.social == nil {
+		m.current.social = &Social{ID: m.current.ID, missing: true}
+	}
+	return m.current.social
+}
+
+// unlockedFor reports whether the applicant has the given stamp unlocked,
+// reading Socials/{uid}.unlockedStamps[<hackathon>].
+func unlockedFor(s *Social, stampID string) bool {
+	arr, _ := getLeaf(s.valueTree(), "unlockedStamps."+hackathon)
+	items, ok := arr.([]any)
+	if !ok {
+		return false // some docs unlock stamps as a raw map/array; ids checked
+	}
+	for _, it := range items {
+		if strings.TrimSpace(fmt.Sprint(it)) == stampID {
+			return true
+		}
+	}
+	return false
+}
+
+// setUnlocked adds or removes the stamp id on
+// Socials/{uid}.unlockedStamps[<hackathon>] in the in-memory tree first;
+// the caller then persists the doc.
+func setUnlocked(s *Social, stampID string, on bool) {
+	tree := s.valueTree()
+	arr, _ := getLeaf(tree, "unlockedStamps."+hackathon)
+	items, _ := arr.([]any)
+	var out []any
+	if on {
+		out = append(items, any(stampID))
+	} else {
+		for _, it := range items {
+			if strings.TrimSpace(fmt.Sprint(it)) != stampID {
+				out = append(out, it)
+			}
+		}
+	}
+	if out == nil {
+		out = []any{}
+	}
+	setLeaf(tree, "unlockedStamps."+hackathon, out)
+}
+
+// startStamps opens the manual stamp picker for the selected applicant.
+func (m model) startStamps() (tea.Model, tea.Cmd) {
+	if m.current == nil {
+		return m, nil
+	}
+	if m.stampList == nil {
+		m.statusMsg = " ✗ Stamp roster not loaded"
+		m.statusErr = true
+		return m, nil
+	}
+	// The picker toggles Socials/{uid}; make sure we have a holder seeded so
+	// the first toggle can create unlockedStamps from nothing.
+	m.docSocial()
+	m.current.social.socialDocSeed()
+	m.stampCursor = 0
+	m.editIdx = 0
+	m.mode = modeStamps
+	return m, nil
+}
+
+// toggleStamp flips one stamp for the selected applicant and immediately
+// writes Socials/{uid}.unlockedStamps.
+func (m model) toggleStamp() (tea.Model, tea.Cmd) {
+	if m.current == nil || m.stampCursor >= len(m.stampList) {
+		return m, nil
+	}
+	st := m.stampList[m.stampCursor]
+	s := m.current.social
+	on := !unlockedFor(s, st.ID)
+	setUnlocked(s, st.ID, on)
+	m.stampSaving = true
+	return m, func() tea.Msg {
+		err := saveSocial(s, []string{"unlockedStamps"})
+		return stampedMsg{err: err, on: on, name: st.Name}
+	}
+}
+
+// stampedMsg reports a single stamp toggle result to render instantly.
+type stampedMsg struct {
+	err  error
+	on   bool
+	name string
 }
 
 func displayName(a *Applicant) string {
@@ -827,7 +1277,7 @@ func (m *model) resize() {
 		m.detailViewport.Height = 1
 	}
 	if m.current != nil {
-		m.detailContent = renderDetails(m.current, m.detailViewport.Width)
+		m.detailContent = renderDetails(*m, m.current, m.detailViewport.Width)
 		m.detailViewport.SetContent(m.detailContent)
 	}
 }
@@ -916,6 +1366,8 @@ func (m model) body(h int) string {
 		lines = append(lines, m.listLines(h-4)...)
 	case modeDetails:
 		lines = append(lines, m.detailCard())
+	case modeStamps:
+		lines = append(lines, m.stampsBody(h))
 	case modeEditPick:
 		lines = append(lines, m.editHeader())
 		lines = append(lines, m.editLines(h-1)...)
@@ -952,6 +1404,8 @@ func (m model) headerLine() string {
 		crumb = styleRule.Render("  /  ") + styleLabel.Render("Details")
 	case modeEditPick, modeEditInput:
 		crumb = styleRule.Render("  /  ") + styleLabel.Render("Editing")
+	case modeStamps:
+		crumb = styleRule.Render("  /  ") + styleLabel.Render("Stamps")
 	}
 	if crumb != "" && lipgloss.Width(left)+lipgloss.Width(crumb) <= m.contentWidth() {
 		left += crumb
@@ -1092,11 +1546,13 @@ func (m model) footerLine() string {
 	case modeSearch:
 		hintsPart = hints(w, "↑↓", "navigate", "⏎", "view details", "esc", "quit")
 	case modeDetails:
-		hintsPart = hints(w, "↑↓", "scroll", "⏎", "edit", "esc", "back")
+		hintsPart = hints(w, "↑↓", "scroll", "⏎/e", "edit", "s", "stamps", "esc", "back")
 	case modeEditPick:
 		hintsPart = hints(w, "↑↓", "choose", "⏎", "edit value", "esc", "cancel")
 	case modeEditInput:
 		hintsPart = hints(w, "⏎", "save to Firestore prod", "esc", "discard")
+	case modeStamps:
+		hintsPart = hints(w, "↑↓", "navigate", "⏎", "toggle stamp", "esc", "back")
 	case modeLoading:
 		return ""
 	}
@@ -1185,8 +1641,13 @@ func (m model) renderRow(i int) string {
 
 func (m model) renderEditRow(i int) string {
 	path := m.editPaths[i]
-	val, _ := getLeaf(m.current.valueTree(), path)
+	tree, leaf := m.docFor(path)
+	val, _ := getLeaf(tree, leaf)
 	disp := leafToEditable(val)
+	// Stamps render as names, not raw stamp ids.
+	if strings.Contains(path, "unlockedStamps") {
+		disp = displayStampValue(val, m.stampID2name)
+	}
 	if disp == "" {
 		disp = "—"
 	}

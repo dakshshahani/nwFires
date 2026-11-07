@@ -49,6 +49,7 @@ type Applicant struct {
 	Doc    map[string]any // typed firestore value tree (raw)
 	fields map[string]any // converted Go value tree
 	blob   string         // lowercase search haystack (lazy)
+	social *Social        // companion Socials/{uid} doc (lazy)
 }
 
 func (a *Applicant) valueTree() map[string]any {
@@ -203,7 +204,202 @@ func saveApplicant(a *Applicant, fieldPaths []string) error {
 	return nil
 }
 
+// Social is the companion Socials/{uid} doc for an applicant.
+// Doc ID = applicant Firebase auth UID (per portal-v2 services/socials.ts).
+type Social struct {
+	ID     string         // same as the applicant's UID
+	Doc    map[string]any // raw typed fields
+	fields map[string]any
+	missing bool // no doc exists yet; display-only, created on first write
+}
+
+func (s *Social) valueTree() map[string]any {
+	if s.fields == nil {
+		s.fields = typedToGo(s.Doc).(map[string]any)
+	}
+	return s.fields
+}
+
+// socialDocSeed gives an absent doc the fields the portal-type Social has,
+// so a first edit creates something well-formed instead of a bare _id.
+func (s *Social) socialDocSeed() {
+	if !s.missing || s.Doc != nil {
+		return
+	}
+	s.Doc = map[string]any{
+		"_id":         map[string]any{"stringValue": s.ID},
+		"email":       map[string]any{"stringValue": ""},
+		"socialLinks": map[string]any{"mapValue": map[string]any{"fields": map[string]any{}}},
+	}
+	s.fields = nil
+}
+
+// fetchSocial reads Socials/{uid}; absent docs are reported via missing.
+func fetchSocial(uid string) (*Social, error) {
+	s := &Social{ID: uid}
+	tok, err := getAccessToken()
+	if err != nil {
+		return nil, err
+	}
+	req, _ := http.NewRequest("GET", basePath+"/Socials/"+uid, nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode == 404 {
+		s.missing = true
+		return s, nil
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("social %s: %d %s", uid, resp.StatusCode, truncate(string(body), 200))
+	}
+	var doc struct {
+		ID     string         `json:"name"`
+		Fields map[string]any `json:"fields"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, err
+	}
+	s.Doc = doc.Fields
+	return s, nil
+}
+
+// saveSocial patches top-level fields of Socials/{uid}, creating the doc if
+// the applicant has none yet.
+func saveSocial(s *Social, fieldPaths []string) error {
+	if !editsWriteToProd {
+		return fmt.Errorf("writes are disabled (editsWriteToProd = false in config.go)")
+	}
+	tok, err := getAccessToken()
+	if err != nil {
+		return err
+	}
+	url := basePath + "/Socials/" + s.ID + "?"
+	for _, fp := range fieldPaths {
+		url += "updateMask.fieldPaths=" + fp + "&"
+	}
+	url = strings.TrimSuffix(url, "&")
+
+	// Seed the identity fields the portal guarantees on creation.
+	tree := s.valueTree()
+	if _, ok := tree["_id"]; !ok {
+		tree["_id"] = s.ID
+	}
+
+	typed, err := goToTyped(tree)
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]any{"fields": typed})
+	req, _ := http.NewRequest("PATCH", url, bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("social save %d: %s", resp.StatusCode, truncate(string(body), 300))
+	}
+	var updated struct {
+		Fields map[string]any `json:"fields"`
+	}
+	if err := json.Unmarshal(body, &updated); err == nil {
+		s.Doc = updated.Fields
+		s.fields = nil
+	}
+	s.missing = false
+	return nil
+}
+
+// Stamp pairs a /Stamps doc ID with its display name.
+type Stamp struct {
+	ID   string
+	Name string
+}
+
+// fetchStamps reads the /Stamps collection (name lives here, not on the
+// applicant — admin-v2/lib/stamps.ts resolves via stamp.name).
+func fetchStamps() ([]Stamp, error) {
+	tok, err := getAccessToken()
+	if err != nil {
+		return nil, err
+	}
+	var out []Stamp
+	pageToken := ""
+	for {
+		url := basePath + "/Stamps?pageSize=300"
+		if pageToken != "" {
+			url += "&pageToken=" + pageToken
+		}
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return nil, fmt.Errorf("stamps %d: %s", resp.StatusCode, truncate(string(body), 200))
+		}
+		var page struct {
+			Documents []struct {
+				Name   string         `json:"name"`
+				Fields map[string]any `json:"fields"`
+			} `json:"documents"`
+			NextPageToken string `json:"nextPageToken"`
+		}
+		if err := json.Unmarshal(body, &page); err != nil {
+			return nil, err
+		}
+		for _, d := range page.Documents {
+			tree := typedToGo(d.Fields).(map[string]any)
+			id := d.Name[strings.LastIndex(d.Name, "/")+1:]
+			out = append(out, Stamp{ID: id, Name: str(tree["name"])})
+		}
+		if page.NextPageToken == "" {
+			break
+		}
+		pageToken = page.NextPageToken
+	}
+	return out, nil
+}
+
+// stampName resolves a stamp id to its display name; unknown ids pass through.
+func stampName(id string, id2name map[string]string) string {
+	if n, ok := id2name[id]; ok {
+		return n
+	}
+	return id
+}
+
+// stampIDsFromNames converts a comma list of stamp names back into ids.
+// Unknown names fail with an error so stale text can't corrupt the doc.
+func stampIDsFromNames(input string, name2id map[string]string) ([]string, error) {
+	var ids []string
+	for _, p := range strings.Split(input, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		id, ok := name2id[p]
+		if !ok {
+			return nil, fmt.Errorf("unknown stamp %q", p)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 // --- display helpers ---
+
+
 
 // renderTree flattens a value tree into "path: value" lines for the details view.
 func renderTree(v any, prefix string, skip map[string]bool, out *[]string) {
@@ -279,8 +475,10 @@ func getLeaf(v map[string]any, path string) (any, bool) {
 	return nil, false
 }
 
-// setLeaf assigns value at a dotted path, returning whether all intermediates
-// were maps (and thus it can be written at all).
+// setLeaf assigns value at a dotted path, creating intermediate maps when
+// they do not exist yet (e.g. first unlockedStamps write on a fresh socials
+// doc). Returns false only when an intermediate is a non-map value that
+// would have to be clobbered.
 func setLeaf(v map[string]any, path string, value any) bool {
 	parts := strings.Split(path, ".")
 	cur := v
@@ -291,7 +489,11 @@ func setLeaf(v map[string]any, path string, value any) bool {
 		}
 		next, ok := cur[p].(map[string]any)
 		if !ok {
-			return false
+			if cur[p] != nil {
+				return false
+			}
+			next = map[string]any{}
+			cur[p] = next
 		}
 		cur = next
 	}
