@@ -87,13 +87,16 @@ next run with a new slug does one cold fetch, and boots stay instant after.
   touched). If the doc doesn't exist yet, the first edit creates it in the
   shape the portal expects.
 - **Stamps by name** — stamp IDs never appear: the `/Stamps` collection is
-  loaded at boot and `unlockedStamps` ids resolve to their `name` on display,
+  loaded at boot (filtered to stamps whose docs belong to the configured
+  hackathon, plus category:"other" stamps — for HackCamp2026 that's 21 of the
+  57 docs) and `unlockedStamps` ids resolve to their `name` on display,
   in both the details view and the edit list. When editing an
   `unlockedStamps` field you type stamp *names* (comma-separated); names are
   converted back to stamp IDs before the save, and unknown names are
   rejected so raw ids can't sneak into the doc.
 - **Manual stamping** — press `s` in the details view to open the stamp
-  picker: the full `/Stamps` roster sorted by name, with `✓` on stamps the
+  picker: the hackathon's stamps (plus category:"other") sorted by name,
+  with `✓` on stamps the
   applicant has unlocked and `○` on locked ones. Enter/space toggles the
   highlighted stamp instantly — the change writes to
   `Socials/{uid}.unlockedStamps[<hackathon>]` right away and the row flips

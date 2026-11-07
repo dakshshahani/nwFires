@@ -323,8 +323,19 @@ type Stamp struct {
 	Name string
 }
 
+// stampForEvent reports whether a /Stamps doc belongs to the configured
+// hackathon (its `hackathon` field must match config's hackathon slug) or is
+// a category:"other" (hackathon-agnostic) stamp. Both groups show in the TUI.
+func stampForEvent(tree map[string]any, hackathon string) bool {
+	if str(tree["hackathon"]) == hackathon {
+		return true
+	}
+	return str(tree["category"]) == "other"
+}
+
 // fetchStamps reads the /Stamps collection (name lives here, not on the
 // applicant — admin-v2/lib/stamps.ts resolves via stamp.name).
+// Only the configured hackathon's stamps and category:"other" stamps load.
 func fetchStamps() ([]Stamp, error) {
 	tok, err := getAccessToken()
 	if err != nil {
@@ -360,6 +371,9 @@ func fetchStamps() ([]Stamp, error) {
 		}
 		for _, d := range page.Documents {
 			tree := typedToGo(d.Fields).(map[string]any)
+			if !stampForEvent(tree, hackathon) {
+				continue
+			}
 			id := d.Name[strings.LastIndex(d.Name, "/")+1:]
 			out = append(out, Stamp{ID: id, Name: str(tree["name"])})
 		}
