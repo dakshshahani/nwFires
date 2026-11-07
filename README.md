@@ -11,6 +11,29 @@ nwfires          # launch the TUI
 nwfires --build  # rebuild the binary from source
 ```
 
+## 🛠 Setup (new machines)
+
+```zsh
+./setup.sh           # checks/installs prerequisites, builds binary if missing, sets up the alias
+./setup.sh --build   # force a rebuild too
+./setup.sh --skip-requirements   # skip the prerequisite checks
+```
+
+It checks — and with your confirmation, installs — the prerequisites:
+- **Go** (builds the binary)
+- **gcloud CLI** (`brew install google-cloud-sdk`)
+- **Firebase CLI** (npm or brew)
+- **Firebase credentials** — if `gcloud auth application-default` isn't set up, it offers to run `gcloud auth application-default login` (what the TUI reads auth actually uses)
+
+Non-interactive environments skip the prompts; pass `--skip-requirements` to
+jump straight to the launcher install.
+
+This installs the `"hackcamp 2026"` script and the `nwfires` wrapper into
+`~/bin`, and appends `alias nwfires="$HOME/bin/nwfires"` to `~/.zshrc` if it's
+not already there (idempotent — safe to re-run). `source ~/.zshrc` afterwards.
+A fresh clone of this repo needs `go` on your PATH plus the Firebase ADC login
+from the note in the Quick start.
+
 First run needs `gcloud auth application-default login` (reads via ADC).
 
 ---
