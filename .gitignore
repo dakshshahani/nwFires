@@ -1,0 +1,6 @@
+# built binary
+/nwFires
+# local snapshot DBs, scratch
+*.sqlite
+*.sqlite-*
+.DS_Store
