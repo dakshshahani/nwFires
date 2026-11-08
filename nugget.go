@@ -9,40 +9,13 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
-// Nuggets dances in the bottom-right corner above the status line.
-// The art is modeled on the nugget mascot SVG: beige body, dark brown
-// tail on the right, two little hands at the sides, dark eyes and a tooth.
+// A dancing ASCII nugget in the bottom-right corner above the status line,
+// built from the nugget mascot SVG (beige body, dark brown tail, side hands).
+// nuggetFrames.go is generated art with colors baked in; this file handles
+// placement and the dance timing.
 
-var (
-	nuggetBody = lipgloss.NewStyle().Foreground(lipgloss.Color("180")) // beige
-	nuggetDark = lipgloss.NewStyle().Foreground(lipgloss.Color("245")) // dark brown tail, dimmed to stay subtle
-)
-
-// nuggetFrames alternates poses: arms up / arms down, tail flick up / down.
-var nuggetFrames = []string{
-	// Pose 1 — hands up, tail flicked up
-	strings.Join([]string{
-		` .-------.         `,
-		`/  ●   ●  \    ~,  `,
-		`|    ᨆ    |~ ~~ \   `,
-		` \   ▽   /      \   `,
-		`  '-.,.-'    __/'   `,
-		`    /   \~~~~~~~     `,
-	}, "\n"),
-	// Pose 2 — hands down, tail down
-	strings.Join([]string{
-		`  .-------.         `,
-		` /  ●   ●  \        `,
-		` |    ᨆ    |---,     `,
-		`  \   ▽   / \  \~    `,
-		`   '-.,.-'   \ \--~   `,
-		`     /   \    ~~~~    `,
-	}, "\n"),
-}
-
-// nuggetInterval keeps the dance slow: an ~8fps terminal repaint for a
-// hand-sized block, far below where anyone would notice input delay.
-const nuggetInterval = 500 * time.Millisecond
+// nuggetInterval keeps the dance slow so terminal repaints stay quiet.
+const nuggetInterval = 400 * time.Millisecond
 
 type nuggetTickMsg struct{}
 
@@ -50,39 +23,33 @@ func nuggetTick() tea.Cmd {
 	return tea.Tick(nuggetInterval, func(time.Time) tea.Msg { return nuggetTickMsg{} })
 }
 
+// nuggetLines is the fixed vertical cost of one dance frame.
+func nuggetLines() int {
+	return len(nuggetFrames[0])
+}
+
 // nuggetBlock returns the colored current frame, placed in the bottom-right
-// corner with a small margin. The frame is kept as one unit (lines' relative
-// offsets preserved), empty when there is no room.
+// corner with a small margin. Empty when there is no room. Frames are placed
+// as a unit so their internal alignment never shifts between poses.
 func (m model) nuggetBlock(width int) string {
-	if width < 16 {
-		return ""
-	}
-	raw := strings.Split(nuggetFrames[m.nuggetFrame%len(nuggetFrames)], "\n")
-	lines := make([]string, len(raw))
-	w := 0
-	for i, line := range raw {
-		line = strings.TrimRight(line, " ")
-		lines[i] = line
-		if tw := ansi.StringWidth(line); tw > w {
-			w = tw
+	f := nuggetFrames[m.nuggetFrame%len(nuggetFrames)]
+	maxW := 0
+	for _, line := range f {
+		if w := ansi.StringWidth(line); w > maxW {
+			maxW = w
 		}
 	}
-	pad := width - w - 2
-	if pad < 0 {
+	pad := width - maxW - 2
+	if pad < 1 || len(f) < 2 {
 		return ""
 	}
 	lead := strings.Repeat(" ", pad)
-	for i := range lines {
-		lines[i] = lead + nuggetLine(lines[i])
+	out := make([]string, len(f))
+	for i, line := range f {
+		out[i] = lead + line
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(out, "\n")
 }
 
-// nuggetLine colors segments: dark for the tail/mouth accents (everything
-// after the body's right edge), beige for the rest.
-func nuggetLine(line string) string {
-	if i := strings.IndexAny(line, "~\\"); i > 0 {
-		return nuggetBody.Render(line[:i]) + nuggetDark.Render(line[i:])
-	}
-	return nuggetBody.Render(line)
-}
+// Foil for unused lint if frames.go ever regenerated empty.
+var _ = lipgloss.NewStyle
