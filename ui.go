@@ -217,7 +217,7 @@ type model struct {
 	stampCursor int
 	stampSaving bool
 
-	nuggetFrame int // index of the current dancing-nugget pose
+	fireHeat [fireRows][fireCols]int // corner fire simulation field
 
 	width  int
 	height int
@@ -293,7 +293,7 @@ func (m *model) filter() {
 var activeCache *cache
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(loadBootCmd, m.fetchStampsCmd(), m.spinner.Tick, nuggetTick())
+	return tea.Batch(loadBootCmd, m.fetchStampsCmd(), m.spinner.Tick, fireTick())
 }
 
 // fetchStampsCmd loads the /Stamps name map once at boot. Names (not ids) are
@@ -377,11 +377,11 @@ func approxAge(t time.Time) string {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case nuggetTickMsg:
-		// Dance pose flips; the tick reschedules itself. Kept coarse so the
-		// terminal repaints for the mascot stay quiet.
-		m.nuggetFrame++
-		return m, nuggetTick()
+	case fireTickMsg:
+		// One step of the corner fire; the tick reschedules itself and the
+		// sim update is only 9x18 cells, so it stays cheap.
+		fireStep(&m.fireHeat)
+		return m, fireTick()
 
 	case loadDoneMsg:
 		if msg.err != nil {
@@ -1360,28 +1360,28 @@ func (m model) View() string {
 		indent(m.headerLine()),
 		indent(styleRule.Render(strings.Repeat("─", m.contentWidth()))),
 		"",
-		indent(m.body(m.bodyHeight() - m.nuggetHeight())),
-		indent(m.nuggetLine()), // dances in the bottom-right corner above the status line
+		indent(m.body(m.bodyHeight() - m.fireHeight())),
+		indent(m.fireLine()), // burns in the bottom-right corner above the status line
 		indent(m.statusLine()), // always reserved, so saves never shift the footer
 		indent(m.footerLine()),
 	}, "\n")
 }
 
-// nuggetHeight is the vertical space the dancing nugget reserves, if any.
-func (m model) nuggetHeight() int {
-	if m.nuggetLine() == "" {
+// fireHeight is the vertical space the corner fire reserves, if any.
+func (m model) fireHeight() int {
+	if m.fireLine() == "" {
 		return 0
 	}
-	return strings.Count(m.nuggetLine(), "\n") + 1
+	return fireLines()
 }
 
-// nuggetLine renders the current dance frame right-aligned in the corner.
+// fireLine renders the current fire frame right-aligned in the corner.
 // Empty string when the terminal is too small to fit the block.
-func (m model) nuggetLine() string {
+func (m model) fireLine() string {
 	if m.mode == modeLoading {
 		return ""
 	}
-	if block := m.nuggetBlock(m.contentWidth() - 2); block != "" {
+	if block := m.fireBlock(m.contentWidth() - 2); block != "" {
 		return block
 	}
 	return ""
