@@ -7,7 +7,7 @@
 #        ./setup.sh --skip-requirements   # only install launchers + alias
 set -euo pipefail
 
-PROJ="$HOME/Documents/Projects/nwplus/nwFires"
+PROJ="$( CDPATH= cd -- "$( dirname -- "$0" )" && pwd )"
 BIN="$HOME/bin"
 
 # Find a working `go` (some PATHs contain unrelated executables named go).
@@ -148,7 +148,7 @@ cat > "$BIN/hackcamp 2026" <<'EOF'
 # Optional: "hackcamp 2026 --build" to rebuild from source
 set -euo pipefail
 
-PROJ="$HOME/Documents/Projects/nwplus/nwFires"
+PROJ="@PROJ@"
 
 if [[ "${1:-}" == "--build" ]]; then
   cd "$PROJ"
@@ -161,6 +161,8 @@ fi
 
 exec "$PROJ/nwFires" "$@"
 EOF
+
+sed -e "s|@PROJ@|$PROJ|" -i.wf-temp "$BIN/hackcamp 2026" && rm -f "$BIN/hackcamp 2026.wf-temp"
 
 cat > "$BIN/nwfires" <<'EOF'
 #!/bin/zsh
