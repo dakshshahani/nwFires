@@ -89,6 +89,18 @@ func (m model) fireBlock(width int) string {
 			if runLen == 0 {
 				return
 			}
+			if runFg == 0 && runBg == 0 {
+				// Unlit cells: skip entirely — never paint glyphs, or they
+				// render in the terminal default colors (white artifacts).
+				// Reset first so the previous run's background doesn't tint
+				// the spaces (that was the pale blocks in the screenshot).
+				sb.WriteString("\x1b[m")
+				for i := 0; i < runLen; i++ {
+					sb.WriteRune(' ')
+				}
+				runLen = 0
+				return
+			}
 			sb.WriteString("\x1b[")
 			parts := []string{}
 			if runFg > 0 {
@@ -121,7 +133,6 @@ func (m model) fireBlock(width int) string {
 		flush()
 		line := ""
 		if wrote {
-			line = "\x1b[m" // reset after painted run
 			line = sb.String() + "\x1b[m"
 		}
 		lines = append(lines, lead+line)
